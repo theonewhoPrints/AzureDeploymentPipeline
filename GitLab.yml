@@ -1,0 +1,129 @@
+stages:
+
+
+  #Terraform STAGES 
+
+  - publish
+  - deploy
+
+
+variables:
+
+  RUNNER_TAG: "cicd-1"
+  PKG: GainLoss_Azure
+  DEV_REPO: gen-dev
+  BAR_REGISTRY: isaacs.repo.com
+  APP_SERVICE: "functionapp1"
+  RESOURCE_GROUP: "resourcegrp_1"
+  DEPLOYMENT_SLOT: main
+  APP_TYPE: functionapp
+  LOCAL_ARTIFACT_NAME: ${PKG}-$[CI_COMMIT_SHORT_SHA].zip
+  REMOTE_ARTIFACT_NAME: ${PKG}-${CI-COMMIT_SHORT_SHA}.zip
+  ARTIFACTORY_IMAGE: isaac-rit-python310:1.0.7
+  DEV_ARTIFACT_URL: https://${BAR_REGISTRY}/artifactory/${DEV_ARTIFACTORY_REPO}/${REMOTE_ARTIFACT_NAME}
+  DEPLOYMENY_SLOT: main
+  SLOT_COMMAND = ""
+  HEALTH_ENDPOINT = ""
+
+#zips and uploads source code to a online repo to be accessed later on. 
+.artifactory_upload:
+  tags: ["${RUNNER_TAG}"]
+  stage: publish
+  image: ${BAR_REGISTRY}/isaac-docker/${ARTIFACTORY_IMAGE}
+  script:
+    -cd publish
+    - zip -q -r ${LOCAL_ARTIFACT_NAME} . -x ".vs/*" ".git/*" ".gitlab-ci.yml" "README.md"
+    - curl -f -u ${BAR_USER}:${BAR_PW} -X PUT "${DEV_ARTIFACT_URL}" -T ${LOCAL_ARTIFACT_NAME}
+
+  retry: !reference [.retry_rules]
+
+
+
+#compiles and gathers source code from dotnet azure function 
+.build_function_app:
+  tags: ["${RUNNER_TAG}"]
+  image: ${BAR_REGISTRY}/isaac-docker/personal-ubi8-dotnet80-sdk
+  extends: .artifactory_upload
+  before_script:
+  - cat /etc/os-release
+  - uname -a
+  - echo "buildin the azure function"
+  - dotnet publish -c Release -o ./publish
+  artifacts:
+    paths:
+     - ./publish
+
+
+
+
+#deploys dotnet azure function source code to the online azure portal. 
+.deploy_azure_template:
+  stage: deploy
+  image: ${BAR_REGISTRY}/isaac-docker/az-terraform
+  tags: ["${RUNNER_TAG}"]
+  before_script:
+    - az login --service-principal --tenant "{ARM_TENANT_ID}" --username "${ARM_CLIENT_ID}" --password "${ARM_CLIENT_PW}"
+    - az account set -s ${ARM_SUBSCRIPTION_ID}
+
+  script:
+    - |
+      if [[-f ${LOCAL_ARTIFACT_NAME} ]]
+      then
+          echo "Local artifact exists, no need to download from repo"
+      else
+          echo "does not exist, downloading from online repo"
+          curl -f -u ${BAR_USER}:${BAR_PW} ${DEV_ARTIFACT_URL} -o ${LOCAL_ARTIFACT_NAME}
+      fi
+    - | 
+      if [[${LOCAL_ARTIFACT_NAME} != *.zip ]]
+      then 
+          zip ${PKG}-${CI_COMMIT_SHORT_SHA}.zip
+          LOCAL_ARTIFACT_NAME=${PKG}-${CI_COMMIT_SHORT_SHA}.zip
+      fi
+    - |
+      if [["${DEPLOYMENY_SLOT}" != "main"]]
+      then 
+          SLOT_COMMAND="--slot ${DEPLOYMENY_SLOT}"
+          SLOT_URL = "-${DEPLOYMENY_SLOT}"
+      fi
+
+    - az ${APP_TYPE} deployment source config-zip --name ${APP_SERVICE} --resource-group ${RESOURCE_GROUP}
+    - echo "{APP_TYPE} deployed "
+    - echo "deployed to ${CI_ENVIRONMENT_URL} in the ${CI_ENVIRONMENT_NAME} environment"
+
+  retry: !reference [.retry_rules]
+
+
+
+.deploy_azure_dev:
+  extends: .deploy_azure_template
+  environment:
+    name: dev
+    action: start
+    uri: "https://${APP_SERVICE}${SLOT_URL}.azurewebsites.net${HEALTH_ENDPOINT}"
+
+  when: manual 
+
+
+
+dev_build:
+  extends: .build_function_app
+  variables:
+    ENV: dev
+  environment:
+    dev
+
+
+
+dev_deploy:
+  extends: .deploy_azure_dev
+  variables:
+    ENV: dev
+  environment:
+    dev
+
+
+
+
+
+
